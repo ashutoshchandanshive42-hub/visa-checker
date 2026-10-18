@@ -1,0 +1,137 @@
+name: H-1B visa slot check
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"     # every 10 minutes (GitHub may delay a few minutes)
+  workflow_dispatch:            # lets you tap "Run workflow" to test
+
+permissions:
+  contents: write               # to save state.json (remembers what it already alerted)
+
+concurrency:
+  group: visa-check
+  cancel-in-progress: false
+
+env:
+  # ---- edit these ----
+  CUTOFF_DATE: "2026-12-31"     # alert only for slots on/before this date ("" = any)
+  LOCATIONS: "CHENNAI,CHENNAI VAC,HYDERABAD,HYDERABAD VAC,KOLKATA,KOLKATA VAC,MUMBAI,MUMBAI VAC,NEW DELHI,NEW DELHI VAC"
+  # --------------------
+  NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check slots
+        run: |
+          python3 - <<'PY'
+          import datetime as dt, json, os, urllib.request
+          from html.parser import HTMLParser
+          from pathlib import Path
+
+          URL = "https://checkvisaslots.com/latest-us-visa-availability/h-1b-regular/"
+          STATE = Path("state.json")
+          TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
+          CUTOFF = os.environ.get("CUTOFF_DATE", "").strip()
+          WATCH = {x.strip().upper() for x in os.environ["LOCATIONS"].split(",") if x.strip()}
+          MANUAL = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+
+          def push(title, body, click="https://www.usvisascheduling.com/"):
+              print(f"ALERT: {title}\n{body}")
+              if not TOPIC:
+                  print("NTFY_TOPIC secret missing - add it in Settings > Secrets > Actions"); return
+              req = urllib.request.Request(f"https://ntfy.sh/{TOPIC}", data=body.encode(),
+                  headers={"Title": title, "Priority": "urgent", "Tags": "passport_control", "Click": click})
+              try: urllib.request.urlopen(req, timeout=15)
+              except Exception as e: print("ntfy push failed:", e)
+
+          class T(HTMLParser):
+              def __init__(s): super().__init__(); s.tables, s.row, s.cell = [], None, None
+              def handle_starttag(s, t, a):
+                  if t == "table": s.tables.append([])
+                  elif t == "tr" and s.tables: s.row = []
+                  elif t in ("td", "th") and s.row is not None: s.cell = []
+              def handle_endtag(s, t):
+                  if t in ("td", "th") and s.cell is not None:
+                      s.row.append(" ".join("".join(s.cell).split())); s.cell = None
+                  elif t == "tr" and s.row is not None:
+                      if s.row: s.tables[-1].append(s.row)
+                      s.row = None
+              def handle_data(s, d):
+                  if s.cell is not None: s.cell.append(d)
+
+          def pdate(x):
+              for f in ("%d %b, %y", "%d %b, %Y", "%d %b %y", "%d %b %Y"):
+                  try: return dt.datetime.strptime(x.strip(), f).date()
+                  except ValueError: pass
+
+          def rows(html):
+              p = T(); p.feed(html)
+              for t in p.tables:
+                  if not t: continue
+                  h = [c.lower() for c in t[0]]
+                  if not any("location" in c for c in h): continue
+                  ix = lambda k: next((i for i, c in enumerate(h) if k in c), None)
+                  L, E, S, W = ix("location"), ix("earliest"), ix("slots on"), ix("last seen")
+                  out = []
+                  for r in t[1:]:
+                      if L is None or E is None or len(r) <= max(L, E): continue
+                      g = lambda i: r[i] if i is not None and i < len(r) else "?"
+                      out.append(dict(loc=r[L].upper(), etxt=r[E], early=pdate(r[E]), slots=g(S), seen=g(W)))
+                  return out
+              return []
+
+          st = json.loads(STATE.read_text()) if STATE.exists() else {"seen": [], "fails": 0, "warned": False}
+          before = json.dumps(st, sort_keys=True)
+
+          try:
+              req = urllib.request.Request(URL, headers={"User-Agent":
+                  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"})
+              data = rows(urllib.request.urlopen(req, timeout=30).read().decode("utf-8", "replace"))
+              err = None if data else "slot table not found (site layout changed?)"
+          except Exception as e:
+              data, err = [], str(e)
+
+          if err:
+              st["fails"] = min(st.get("fails", 0) + 1, 3)
+              print("Problem:", err)
+              if (st["fails"] >= 3 or MANUAL) and not st.get("warned"):
+                  push("Visa checker needs attention", f"GitHub can't read checkvisaslots.com: {err}", URL)
+                  st["warned"] = True
+          else:
+              st["fails"], st["warned"] = 0, False
+              cut = dt.date.fromisoformat(CUTOFF) if CUTOFF else None
+              hits = []
+              for r in data:
+                  print(f"  {r['loc']:<15} {r['etxt']:<11} slots {r['slots']:<4} seen {r['seen']}")
+                  key = f"{r['loc']}|{r['etxt']}|{r['seen']}"
+                  new = key not in st["seen"]
+                  if new: st["seen"].append(key)
+                  if new and r["loc"] in WATCH and r["early"] and (not cut or r["early"] <= cut):
+                      hits.append(r)
+              st["seen"] = st["seen"][-500:]
+              if hits:
+                  body = "\n".join(f"{h['loc']}: {h['early']:%d %b %Y} ({h['slots']} slots) - seen {h['seen']}" for h in hits)
+                  push("HIT SIGN IN NOW - H-1B slot: " + ", ".join(h["loc"] for h in hits),
+                       body + "\nOpen usvisascheduling.com and book - slots go in minutes.")
+              elif MANUAL:
+                  push("Visa checker is running", f"Read {len(data)} locations. No new slots on/before {CUTOFF or 'any date'} right now.", URL)
+              print(f"{len(data)} rows, {len(hits)} new matching")
+
+          if json.dumps(st, sort_keys=True) != before:
+              STATE.write_text(json.dumps(st))
+          PY
+
+      - name: Save state
+        run: |
+          if [ -n "$(git status --porcelain state.json)" ]; then
+            git config user.name "visa-bot"
+            git config user.email "visa-bot@users.noreply.github.com"
+            git add state.json
+            git commit -m "update slot state" -q
+            git push -q || echo "push skipped"
+          fi
